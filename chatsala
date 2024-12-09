@@ -1,1 +1,107 @@
+#include <devide.h>
+#include <devicetree.h>
+#include <drivers/gpio.h>
+#include <sys/printk.h>
+#include <sys/fifo.h>
 
+#define TAMANHO_PILHA 1024
+
+#define GPIO "GPIOB"
+#define GPIO_TX 18 // PTB18
+
+K_FIFO_DEFINE(fifo_tx);
+
+struct byte {
+    void *ex;
+    uint8_t dado;
+}
+
+const struct device *dispositivo_gpio;
+uint8_t n = 0; // Variável global - número de bytes
+
+void start_gpio(void)
+{
+    dispositivo_gpio = device_get_binding(GPIO);
+    gpio_pin_configure(dispositivo_gpio, GPIO_TX, GPIO_OUTPUT_ACTIVE);
+}
+
+void enviar_mensagem(uint8_t dado)
+{
+    for (int i = 0; i < 8; i++) {
+        gpio_pin_set(dispositivo_gpio, GPIO_TX, (dado >> (7 - i)) & 0x01);
+        k_sleep(K_MSEC(1));
+    }
+}
+
+void teclado_thread(void)
+{
+    uint8_t letra;
+    struct byte *tx_dado;
+
+    while (1) {
+        do {
+            printk("Digite o nº de bytes da mensagem de 0 a 7: ");
+            n = console_getchar() - '0';
+
+            if (n > 7) {
+                printk("ERRO. DIGITE UM NÚMERO VÁLIDO!");
+            }
+        } while (n > 7);
+
+        for (uint8_t i = 0; i < n; i++) {
+            printk("Digite um caractere: ");
+            letra = console_getchar();
+            printk("%c\n", letra);
+
+            tx_dado = k_malloc(sizeof(struct byte));
+            if (tx_dado != NULL) {
+                tx_dado->ex = letra;
+                k_fifo_put(&fifo_tx, tx_dado);
+            }
+            k_sleep(K_MSEC(100));
+        }
+    }
+}
+
+void transmissao_thread(void)
+{
+    const uint8_t byte_sync = 0xAA;       // Byte de sincronização
+    const uint8_t byte_STX = 0x55;           // Byte STX
+    uint8_t byte_ID;                      // Byte com ID (00111) e n
+    const uint8_t random_byte2 = 0x7F;    // Byte aleatório 2 (escolhido)
+    struct uart_data_t *fifo_data;
+
+    while (1) {
+        enviar_mensagem('U');             // Caractere 'U' (ASCII 85)
+        enviar_mensagem(byte_sync);       // Byte de sincronização
+        enviar_mensagem(byte_STX);    // Byte aleatório 1
+
+        // Configura o byte de ID com o número de bytes
+        id_byte = (0x1C << 3) | n;  // 00111 << 3 | n
+        enviar_mensagem(byte_ID);         // Byte com ID e n
+
+        // Transmissão dos dados armazenados na FIFO
+        for (uint8_t i = 0; i < n; i++) {
+            dado_fifo = k_fifo_get(&fifo_tx, K_FOREVER);
+            if (dado_fifo != NULL) {
+                enviar_mensagem(dado_fifo->data);
+                k_free(dado_fifo);
+            }
+        }
+
+        enviar_mensagem(byte_end);    // Byte de fim
+        k_sleep(K_MSEC(1000));           // Atraso de 1 segundo entre transmissões
+    }
+}
+
+K_THREAD_DEFINE(teclado_tid, TAMANHO_PILHA, teclado_thread, NULL, NULL, NULL, NULL, 0, 0);
+K_THREAD_DEFINE(transmissao_tid, TAMANHO_PILHA, transmissao_thread, NULL, NULL, NULL, NULL, 0, 0);
+
+void main(void)
+{
+    start_gpio();
+
+    while (1) {
+        k_sleep(K_SECONDS(10));
+    }
+}
