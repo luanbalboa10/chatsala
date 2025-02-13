@@ -44,10 +44,8 @@ void teclado_thread(void)
     struct byte *tx_dado; /* crio um ponteiro tx_dado que aponta
                              para uma estrutura do tipo byte */
 
-    while (1) {
-
-        /* teclado, só pode escrever no máximo 7 caracteres */
-        do {
+    /* teclado, só pode escrever no máximo 7 caracteres */
+    do {
             int i = 0;
             printk("Digite uma frase (de 0 a 7 caracteres) e pressione
             enter para enviar : ");
@@ -56,13 +54,13 @@ void teclado_thread(void)
 
             if (strlen(tx_buf) > 7) {
                 printk("ERRO!\n");
+                while (console_getchar() != '\n') {
+                } // zera o console
                 for (int j = 0; j < strlen(tx_buf); j++) {
                     tx_buf[j] = 0;
                 }   /* zera o buffer */
-                i = 0;
             } 
-
-        } while (console_getchar() != 13);
+    } while (tx_buf[i-1] != '\n');
 
         n = strlen(tx_buf); /* guarda em n o tamanho da mensagem
                                para usar no cabeçalho */
@@ -79,8 +77,8 @@ void teclado_thread(void)
             }
             k_sleep(K_MSEC(100));
         }
-    }
 }
+
 
 void transmissao_thread(void)
 {
