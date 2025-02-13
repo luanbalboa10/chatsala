@@ -12,6 +12,8 @@
 #define GPIO_RX 19 // PTB19 (pino GPIO de recepção)
 
 K_FIFO_DEFINE(fifo_tx); // define e inicializa a fifo de transmissão
+struct k_sem console; // entre teclado e transmissão
+struct k_sem mensagem; // entre transmissão e recepção 
 
 /* necessária para que os dados sejam organizados na FIFO corretamente */
 struct byte {
@@ -40,6 +42,7 @@ void enviar_mensagem(uint8_t dado)
 
 void teclado_thread(void)
 {
+    k_sem_take(&console, K_FOREVER);
     char tx_buf[8] = 0;
     struct byte *tx_dado; /* crio um ponteiro tx_dado que aponta
                              para uma estrutura do tipo byte */
@@ -77,11 +80,15 @@ void teclado_thread(void)
             }
             k_sleep(K_MSEC(100));
         }
+    k_sem_give(&console);
 }
-
 
 void transmissao_thread(void)
 {
+    /* pega os dois semáforos */
+    k_sem_take(&console, K_FOREVER); 
+    k_sem_take(&mensagem, K_FOREVER);
+
     const uint8_t sync = 0x16; // Byte de sincronização
     const uint8_t STX = 0x55;  // Byte STX
     uint8_t cabecalho;         // Byte com ID (11010) e n
@@ -95,7 +102,7 @@ void transmissao_thread(void)
 
         // Configura o byte de ID com o número de bytes
         cabecalho = (0x1A << 3) | n; // 11010 << 3 | n
-        enviar_mensagem(ID);         // Byte com ID e n
+        enviar_mensagem(cabecalho);  // Byte com ID e n
 
         // Transmissão dos dados armazenados na FIFO
         for (uint8_t i = 0; i < n; i++) {
@@ -107,12 +114,32 @@ void transmissao_thread(void)
         }
 
         enviar_mensagem(end);   // Byte de fim
+
+        /* devolve os semáforos para outras threads utilizarem */
+        k_sem_give(&console); 
+        k_sem_give(&mensagem);
+
         k_sleep(K_MSEC(1000));  // Atraso de 1 segundo entre transmissões
     }
 }
 
+void recepcao_thread(void){
+
+    struct byte *recepcao_fifo;
+
+    while (1) {
+
+    k_sem_take(&mensagem, K_FOREVER); // Aguarda até que a trasmissão seja concluída
+    
+    }
+
+    
+}
+
 K_THREAD_DEFINE(teclado_tid, TAMANHO_PILHA, teclado_thread, NULL, NULL, NULL, NULL, 0, 0);
 K_THREAD_DEFINE(transmissao_tid, TAMANHO_PILHA, transmissao_thread, NULL, NULL, NULL, NULL, 0, 0);
+K_THREAD_DEFINE(recepcao_tid, TAMANHO_PILHA, recepcao_thread, NULL, NULL, NULL, NULL, 0, 0);
+k_sem_init(&semaforo, 0, 1);
 
 void main(void)
 {
