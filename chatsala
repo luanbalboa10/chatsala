@@ -1,29 +1,50 @@
 #include <device.h>
 #include <devicetree.h>
 #include <drivers/gpio.h>
+#include <drivers/uart.h> 
 #include <sys/printk.h>
 #include <sys/fifo.h>
 #include <string.h>
 
 #define TAMANHO_PILHA 1024 // define o tamanho da pilha para as threads
-
+#define TAMANHO_MENSAGEM 8
 #define GPIO "GPIOB"
 #define GPIO_TX 18 // PTB18 (pino GPIO de transmissão)
 #define GPIO_RX 19 // PTB19 (pino GPIO de recepção)
+#define T 100 // tempo
 
-K_FIFO_DEFINE(fifo_tx); // define e inicializa a fifo de transmissão
-struct k_sem console; // entre teclado e transmissão
-struct k_sem mensagem; // entre transmissão e recepção 
+K_MSGQ_DEFINE(teclado_fila, TAMANHO_MENSAGEM, 1, 4) // define uma message queue
 
-/* necessária para que os dados sejam organizados na FIFO corretamente */
-struct byte {
-    void *ex; /* ponteiro reservado para ser o primeiro campo da fifo,
-                 para a fifo gerenciar os itens na fila */
-    uint8_t dado; /* armazena um byte de dado que será transmitido */
-}
+const struct device *dispositivo_gpio; 
+const struct device *uart_dev;
+volatile int n = 0; // variável global - número de bytes da mensagem 
+volatile int variavel; // variável global - valor recebido
 
-const struct device *dispositivo_gpio; /* */
-uint8_t n = 0; /* variável global - número de bytes da mensagem */
+struct k_sem console; // entre serial_cb e transmissão
+struct k_mutex rx_mux; // mutex
+
+K_THREAD_DEFINE(transmissao_tid, TAMANHO_PILHA, transmissao_thread, NULL, NULL, NULL, NULL, 0, 0);
+K_THREAD_DEFINE(recepcao_tid, TAMANHO_PILHA, recepcao_thread, NULL, NULL, NULL, 1, 0, 0);
+K_THREAD_DEFINE(comparador_tid, TAMANHO_PILHA, comparador_thread, NULL, NULL, NULL, 2, 0, 0);
+//prioridade da recepção maior que comparação
+
+// Pacote de dados 
+const uint8_t sync = 0x16; // Byte de sincronização
+const uint8_t STX = 0x55;  // Byte STX
+uint8_t cabecalho;         // Byte com ID (11010) e n 
+const uint8_t end = 0x17;  // Byte end 
+struct byte *dado_fifo;
+
+// Protótipos das funções
+void start_gpio(void);
+void start_uart(void);
+void enviar_mensagem(uint8_t dado);
+void serial_cb(const struct device *dev, void *user_data);
+void transmissao_thread(void);
+void recepcao_thread(void); 
+void comparador_thread(void);
+uint8_t vetor_para_int(uint8_t *vetor, int tamanho);
+void imprimir_mensagem(static int mensagem_buf[56], int tm);
 
 void start_gpio(void) 
 {
@@ -32,68 +53,52 @@ void start_gpio(void)
     gpio_pin_configure(dispositivo_gpio, GPIO_RX, GPIO_INPUT_ACTIVE);
 }
 
+/* configura e habilita as interrupções da UART */
+void start_uart(void)
+{
+    uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console)); // uart_dev foi definida e configurada
+    uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL); // vincula o callback (serial_cb) ao dispositivo UART
+    uart_irq_rx_enable(uart_dev); // habilita as interrupções de recepção de dados na UART
+}
+
 void enviar_mensagem(uint8_t dado)
 {
     for (int i = 0; i < 8; i++) {
-        gpio_pin_set(dispositivo_gpio, GPIO_TX, (dado >> (7 - i)) & 0x01);
-        k_sleep(K_MSEC(1));
+        gpio_pin_set(dispositivo_gpio, GPIO_TX, (dado >> (7 - i)) & 0x01); // mais significativo
+        k_sleep(K_MSEC(4*T)); 
     }
 }
 
-void teclado_thread(void)
+/* função de callback da interrupção na UART */
+void serial_cb(const struct device *dev, void *user_data)
 {
-    k_sem_take(&console, K_FOREVER);
-    char tx_buf[8] = 0;
-    struct byte *tx_dado; /* crio um ponteiro tx_dado que aponta
-                             para uma estrutura do tipo byte */
+    k_sem_take(&console, K_FOREVER); 
 
-    /* teclado, só pode escrever no máximo 7 caracteres */
-    do {
-            int i = 0;
-            printk("Digite uma frase (de 0 a 7 caracteres) e pressione
-            enter para enviar : ");
-            tx_buf [i] = console_getchar();
-            i++;
-
-            if (strlen(tx_buf) > 7) {
-                printk("ERRO!\n");
-                while (console_getchar() != '\n') {
-                } // zera o console
-                for (int j = 0; j < strlen(tx_buf); j++) {
-                    tx_buf[j] = 0;
-                }   /* zera o buffer */
-            } 
-    } while (tx_buf[i-1] != '\n');
-
-        n = strlen(tx_buf); /* guarda em n o tamanho da mensagem
-                               para usar no cabeçalho */
-        
-
-        /* coloca na fifo a frase digitada */
-        for (int i = 0; i < n; i++) { 
-            uint8_t letra; 
-            letra = tx_buf[i];
-            struct byte *cara = k_malloc(sizeof(struct byte));
-            if (cara != NULL) {
-                cara->dado = letra;
-                k_fifo_put(&fifo_tx, cara);
-            }
-            k_sleep(K_MSEC(100));
+    static char tx_buf[8];
+    static int tx_buf_pos;
+    uint8_t c;
+    
+    while (uart_fifo_read(uart_dev, &c, 1) == 1) {
+        if ((c == '\n' || c == '\r') && tx_buf_pos > 0) {
+            tx_buf[tx_buf_pos] = '\0';
+            k_msgq_put(&teclado_fila, &tx_buf, K_NO_WAIT);
+            n = tx_buf_pos;
+            tx_buf_pos = 0;
+            k_sem_give(&console);
+        } else if (tx_buf_pos < (sizeof(tx_buf) - 1) ) {
+            tx_buf[tx_buf_pos++] = c;
         }
-    k_sem_give(&console);
+        /* Qualquer caractere além do tamanho do buffer é descartado */
+        }
+    
 }
 
 void transmissao_thread(void)
 {
     /* pega os dois semáforos */
     k_sem_take(&console, K_FOREVER); 
-    k_sem_take(&mensagem, K_FOREVER);
-
-    const uint8_t sync = 0x16; // Byte de sincronização
-    const uint8_t STX = 0x55;  // Byte STX
-    uint8_t cabecalho;         // Byte com ID (11010) e n
-    const uint8_t end = 0x17;  // Byte end 
-    struct byte *dado_fifo;
+    static uint8_t dados[TAMANHO_MENSAGEM]; // {F, E, 0, 0, 0, 0, 0, 0} 
+    uint8_t var = 0;
 
     while (1) {
         enviar_mensagem('U');   // Caractere 'U' (ASCII 85)
@@ -101,54 +106,160 @@ void transmissao_thread(void)
         enviar_mensagem(STX);   // Byte aleatório 1
 
         // Configura o byte de ID com o número de bytes
-        cabecalho = (0x1A << 3) | n; // 11010 << 3 | n
+        cabecalho = (0x1A << 3) | n; // (11010 << 3) | n
         enviar_mensagem(cabecalho);  // Byte com ID e n
 
-        // Transmissão dos dados armazenados na FIFO
-        for (uint8_t i = 0; i < n; i++) {
-            dado_fifo = k_fifo_get(&fifo_tx, K_FOREVER);
-            if (dado_fifo != NULL) {
-                enviar_mensagem(dado_fifo->data);
-                k_free(dado_fifo);
-            }
+        // Transmissão dos dados armazenados na fifo
+        k_msgq_get(&teclado_fila, &dados, K_FOREVER); 
+        for (int i = 0; i < n; i++) {
+            var = dados[i]; 
+            enviar_mensagem(var);
         }
-
+        
         enviar_mensagem(end);   // Byte de fim
 
         /* devolve os semáforos para outras threads utilizarem */
         k_sem_give(&console); 
-        k_sem_give(&mensagem);
 
-        k_sleep(K_MSEC(1000));  // Atraso de 1 segundo entre transmissões
     }
 }
 
 void recepcao_thread(void){
 
-    struct byte *recepcao_fifo;
+    k_mutex_lock(&rx_mux, K_FOREVER);
+
+    static int rx_buf[4];
+    int j = 1;
 
     while (1) {
 
-    k_sem_take(&mensagem, K_FOREVER); // Aguarda até que a trasmissão seja concluída
-    
+        for (int i = 0; i < 4; i++) {
+            rx_buf[i] = gpio_pin_get(dispositivo_gpio, GPIO_RX); // recebe 4 vezes o mesmo bit e guarda em um buffer
+            k_sleep(K_MSEC(T)); 
+        } 
+        if (rx_buf[j] == rx_buf[j+1]){
+            variavel = rx_buf[j]; // valida o bit 
+            k_mutex_unlock(&rx_mux); // libera o mutex para a thread de comparação (comparador_thread)
+        }
+        memset(rx_buf, 0, 32); // zera o buffer
     }
-
+}
+ 
+void comparador_thread(void) {
     
+    k_mutex_lock(&rx_mux, K_FOREVER);
+
+    static int mensagem_buf[56];
+    static int id_buf[5];
+    static int n_buf[3];
+    int resp = 0;
+
+    int count = 0; 
+    int count2 = 0;
+    int count3 = 0;
+    int count4 = 0;
+    int count5 = 0;
+    int count6 = 0;
+
+    while (1) {
+
+        if (count < 8) {    // compara o 1º byte (SYNC)
+            if (variavel == (sync >> 7 - count)) { 
+                count++;
+            } 
+            else {
+                count = 0; // zera caso seja incompatível
+            }
+        } 
+
+        if (count < 16 && count > 7) {   // compara o 2º byte (STX)
+            if (variavel == (STX >> 7 - count2)) { 
+                count2++;
+                count++;
+            } 
+            else {
+                count = 0;
+            }
+        } 
+
+        if (count > 15 && count < 21) { // guarda o ID do usuário transmissor 
+            id_buf[count3] = variavel;
+            count3++;
+            count++;
+        }
+
+        if (count > 20 && count < 24) {    // guarda o tamanho da mensagem
+            n_buf[count4] = variavel; 
+            count4++;
+            count++;
+        } 
+
+        if (count == 24) { // calcula o tamanho da mensagem em bits
+            resp = vetor_para_int(n_buf, 3);
+            int tm = resp*8;
+        }
+
+        // coloca a mensagem no buffer
+        if (count > 23 && (count < tm + 24)) {
+            mensagem_buf[count5] = variavel;
+            count5++;
+            count++;
+        }
+
+        if ((count > tm + 23)  && (count < tm + 31)) {   // compara o último byte (end)
+            if (variavel == (end >> 7 - count6)) { 
+                count6++;
+                count++;
+            } 
+            else {
+                count = 0;
+            }
+        } 
+
+        if (count > tm + 30) { // caso tudo ok, imprime no monitor
+            imprimir_mensagem(mensagem_buf, tm, id_buf);
+            count = 0;
+        }
+
+    k_mutex_unlock(&rx_mux); // libera o mutex
+        
+    }
 }
 
-K_THREAD_DEFINE(teclado_tid, TAMANHO_PILHA, teclado_thread, NULL, NULL, NULL, NULL, 0, 0);
-K_THREAD_DEFINE(transmissao_tid, TAMANHO_PILHA, transmissao_thread, NULL, NULL, NULL, NULL, 0, 0);
-K_THREAD_DEFINE(recepcao_tid, TAMANHO_PILHA, recepcao_thread, NULL, NULL, NULL, NULL, 0, 0);
-k_sem_init(&semaforo, 0, 1);
+// converte bits de um vetor para inteiro
+uint8_t vetor_para_int(uint8_t *vetor, int tamanho) { 
+    uint8_t valor = 0; 
+    for (int i = 0; i < tamanho; i++) {
+        valor |= (vetor[i] << tamanho - 1 - i); 
+    }
+    return valor;
+} 
+
+// imprime a mensagem no monitor
+void imprimir_mensagem (static int mensagem_buf[56], int tm, int id_buf[5]) {
+    int id = vetor_para_int(id_buf, 5);
+    printk("Seu amigo (ID = %d) enviou esta mensagem: ", id); 
+    for (int i = 0; i < tm; i += 8) {
+        uint8_t byte = 0;
+        for (int j = 0; j < 8; j++) {
+            byte |= (mensagem_buf[i + j] << (8 - 1 - j));
+        }
+        char c = (char)byte;
+        printk("%c", c);
+    }
+}
 
 void main(void)
 {
+    k_sem_init(&console, 0, 1);
+    k_mutex_init(&rx_mux);
+
     start_gpio();
+    start_uart();
 
     while (1) {
         k_sleep(K_SECONDS(10));
     }
+
 }
-        k_sleep(K_SECONDS(10));
-    }
-}
+    
