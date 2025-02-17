@@ -44,7 +44,7 @@ void transmissao_thread(void);
 void recepcao_thread(void); 
 void comparador_thread(void);
 uint8_t vetor_para_int(uint8_t *vetor, int tamanho);
-void imprimir_mensagem(static int mensagem_buf[56], int tm);
+void imprimir_mensagem(static int mensagem_buf[56], int tm, int id_buf[5]);
 
 void start_gpio(void) 
 {
